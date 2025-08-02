@@ -5,7 +5,7 @@ import Control.Monad.Reader as R
 import Control.Monad.State
 import Control.Monad.Writer as W
 import Data.Map as M
-import Solver2 (run)
+import Solver (run)
 
 main :: IO ()
 main = print run
@@ -30,16 +30,15 @@ main = print run
 -- log :: String -> Writer [String] ()
 -- log str = W.tell [str]
 
--- fib :: Int -> Int
--- fib 1 = 1
--- fib 2 = 1
--- fib n = fib (n - 1) + fib (n - 2)
+fib :: Int -> Int
+fib 1 = 1
+fib 2 = 1
+fib n = fib (n - 1) + fib (n - 2)
 
--- f :: State Int ()
--- f = modify (+1)
+f :: State Int ()
+f = modify (+1)
 
--- g :: Int -> Int
--- g n = evalState (do
---         forM_ [1..n] $ const f
---         get
---     ) n
+g :: Int -> Int
+g n = execState (do
+        forM_ [1..n] $ const f
+    ) n

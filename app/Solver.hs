@@ -1,12 +1,19 @@
+{-# LANGUAGE BlockArguments #-}
+
 module Solver (run) where
 
-import Data.List (elemIndex, find, nub)
-import Data.Map (Map, insert, (!))
-import Data.Map qualified as Map
+import Control.Monad (unless)
+import Control.Monad.State.Strict
+import Data.List (delete, elemIndex, find, sortBy, (\\))
+import Data.Map.Strict (Map, insert, (!))
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromJust)
+import Data.Tuple (swap)
+import Debug.Trace (trace)
 
-type Vertex = String
+newtype Vertex = Vertex String deriving (Show, Eq, Ord)
 
-data Cost = Finite Int | Inf deriving (Read)
+data Cost = Finite Int | Inf deriving (Show)
 
 instance Eq Cost where
   Inf == Inf = True
@@ -20,16 +27,11 @@ instance Ord Cost where
   compare _ Inf = LT
   compare (Finite x) (Finite y) = compare x y
 
--- Show instance: show Inf as "inf", Finite as number
-instance Show Cost where
-  show Inf = "inf"
-  show (Finite x) = show x
-
 data Register = Reg Int | Spill deriving (Show, Read, Ord, Eq)
 
 type CostV = [Cost]
 
-type CostM = [[Cost]]
+type CostM = [CostV]
 
 type Edge = (Vertex, Vertex)
 
@@ -37,149 +39,132 @@ type CostF = (Map Vertex CostV, Map Edge CostM)
 
 type Solution = Map Vertex Register
 
-type Stack a = [a]
+-- undirected graph, but keeps edges in both directions
+type Graph = ([Vertex], [Edge])
 
-type Graph = ([Vertex], [Edge], CostF)
+type Stack = [Vertex]
+
+type Ctx = (Graph, Stack, CostF)
 
 adj :: Graph -> Vertex -> [Vertex]
-adj (_, es, _) v = nub [to | (from, to) <- es, from == v] ++ [from | (from, to) <- es, to == v]
+adj (_, es) v =  let res =  [to | (from, to) <- es, from == v] in trace ("adj of " ++ show v ++ " = " ++ show res) res
 
-deg :: Graph -> Vertex -> Int
-deg (_, es, _) v = length [() | (from, to) <- es, from == v || to == v]
-
-remove :: (Eq a) => a -> [a] -> [a]
-remove element = filter (/= element)
+degree :: Graph -> Vertex -> Int
+degree = (length .) . adj
 
 addCost :: Cost -> Cost -> Cost
 addCost Inf _ = Inf
 addCost _ Inf = Inf
 addCost (Finite a) (Finite b) = Finite (a + b)
 
-addCostM :: CostM -> CostM -> CostM
-addCostM = zipWith addCostV
-
 addCostV :: CostV -> CostV -> CostV
 addCostV = zipWith addCost
 
-findFirstMin :: (Ord a) => [a] -> Int
+addCostM :: CostM -> CostM -> CostM
+addCostM = zipWith addCostV
+
+removeVertex :: Vertex -> [Edge] -> [Edge]
+removeVertex _ [] = []
+removeVertex x (e@(from, to) : es) = if from == x || to == x then removeVertex x es else e : removeVertex x es
+
+-- push x to stack and remove the vertex from graph
+pushVertex :: Vertex -> State Ctx ()
+pushVertex x = do
+  modify (\((vs, es), s, c) -> ((delete x vs, removeVertex x es), x : s, c))
+  trace ("pushVertex x = " ++ show x) $ pure ()
+
+findFirstMin :: (Ord a, Show a) => [a] -> Int
 findFirstMin xs = let x = minimum xs in head $ map fst (filter ((== x) . snd) (zip [0 ..] xs))
 
-spillCost :: Int
-spillCost = 1000
+matrixColumn :: Show a => [[a]] -> Int -> [a]
+matrixColumn m j = [row !! j | row <- m]
 
-reduceI :: Graph -> Solution -> Vertex -> (Graph, Solution)
-reduceI g@(vs, es, (w, w2)) s x =
-  let [y] = adj g x
-      cx = w ! x
+transpose :: [[a]] -> [[a]]
+transpose ([] : _) = []
+transpose x = map head x : transpose (map tail x)
+
+updateCostM :: Edge -> CostM -> Map Edge CostM -> Map Edge CostM
+updateCostM e m = Map.union (Map.fromList [(e, m), (swap e, transpose m)])
+
+-- call with the only adj vertex y of x
+reduceI :: Vertex -> Vertex -> State Ctx ()
+reduceI x y = do
+  pushVertex x
+  (g, s, (w, w2)) <- get
+  let cx = w ! x
       cy = w ! y
-      delta :: [Cost] = map (minimum . addCostV cx) (w2 ! (y, x))
-      cy' = addCostV delta cy
-   in ((remove x vs, remove (x, y) es, (insert y cy' w, w2)), s)
-
-reduceII :: Graph -> Solution -> Vertex -> (Graph, Solution)
-reduceII g@(vs, es, (w, w2)) s x =
-  let [y, z] = adj g x
       cyx = w2 ! (y, x)
+      delta = map (minimum . addCostV cx) cyx
+   in put (g, s, (insert y (addCostV cy delta) w, w2))
+
+reduceII :: Vertex -> Vertex -> Vertex -> State Ctx ()
+reduceII x y z = do
+  pushVertex x
+  (g@(vs, es), s, (w, w2)) <- get
+  let cyx = w2 ! (y, x)
       czx = w2 ! (z, x)
       cyz = w2 ! (y, z)
       cx = w ! x
-      delta = [[minimum $ zipWith3 (\a b c -> addCost a (addCost b c)) i j cx | j <- czx] | i <- cyx]
-      es' = remove (x, z) $ remove (x, y) es
+      delta = [[minimum $ addCostV i (addCostV j cx) | j <- czx] | i <- cyx]
    in case find (== (y, z)) es of
-        Just _ -> ((remove x vs, es', (w, insert (y, z) (addCostM cyz delta) w2)), s)
-        Nothing -> ((remove x vs, (y, z) : es', (w, insert (y, z) delta w2)), s)
+        Just _ -> put (g, s, (w, updateCostM (y, z) (addCostM cyz delta) w2))
+        Nothing -> put ((vs, (y, z) : (z, y) : es), s, (w, updateCostM (y, z) delta w2))
 
-reduceN :: Graph -> Solution -> Vertex -> (Graph, Solution)
-reduceN g@(vs, es, f@(w, w2)) s x =
-  let cx = w ! x
-      c :: [Cost] = map (\i -> foldl (\ci y -> ci `addCost` minimum (addCostV ((w2 ! (x, y)) !! i) (w ! y))) (Finite 0) (adj g x)) [0 .. length cx - 1]
-      -- no forbidden assignments
-      s' = insert x (Reg $ findFirstMin c) s
-      vs' = remove x vs
-      es' :: [Edge] = foldl (\es y -> remove (x, y) es) es (adj g x)
-      (_, (w', w2')) :: (CostV, CostF) =
-        foldl
-          ( \(c, (w, w2)) y ->
-              let cxy = w2 ! (x, y)
-                  (Reg sx) = s' ! x
-                  (xs, csx : ys) = splitAt sx cxy
-                  csx' = map (`replace` deg g x) csx
-                  c' = zipWith (\a b -> (if b == Inf then replace b (deg g x) else a)) c csx
-                  cxy' = xs ++ csx' : ys
-                  cy = addCostV (w ! y) c'
-               in (c', (insert y cy w, insert (x, y) cxy' w2))
-          )
-          (c, f)
-          (adj g x)
-   in ((vs', es', (w', w2')), s')
-  where
-    replace :: Cost -> Int -> Cost
-    replace Inf degree = Finite $ spillCost `div` degree
-    replace c _ = c
+sortGraph :: State Ctx ()
+sortGraph = do
+  (g@(vs, es), c, f) <- get
+  put ((sortBy (\a b -> compare (degree g a) (degree g b)) vs, es), c, f)
 
--- vertices of degree of n
-dns :: Graph -> Int -> Maybe [Vertex]
-dns g@(vs, _, _) n = let res = filter (\v -> deg g v == n) vs in if null res then Nothing else Just res
+-- require: vertices are sorted by their degree
+reduceGraph :: State Ctx ()
+reduceGraph = do
+  sortGraph
+  (g@(_, es), stack, f) <- get
+  case fst g of
+    [] -> modify id
+    (v : vs) ->
+      case adj g v of
+        [] -> put ((vs, es), stack, f)
+        [y] -> reduceI v y
+        [y, z] -> reduceII v y z
+        _ -> undefined
+  unless (null $ fst g) reduceGraph
 
-reduceGraph :: Graph -> Solution -> Stack Vertex -> (Graph, Solution, Stack Vertex)
-reduceGraph g@(_, [], _) s svs = (g, s, svs) -- no more edges
-reduceGraph g@(vs, es, f) s svs =
-  case dns g 0 of
-    Just (v0 : _) ->
-      reduceGraph (remove v0 vs, es, f) s svs
-    Nothing -> case dns g 1 of
-      Just (v1 : _) ->
-        -- Bucket 1 (degree 1)
-        let (g', s') = reduceI g s v1
-         in reduceGraph g' s' (v1 : svs)
-      Nothing -> case dns g 2 of
-        Just (v2 : _) ->
-          -- Bucket 2 (degree 2)
-          let (g', s') = reduceII g s v2
-           in reduceGraph g' s' (v2 : svs)
-        Nothing -> case vs of
-          (v : _) ->
-            -- Any other vertex
-            let (g', s') = reduceN g s v
-             in reduceGraph g' s' (v : svs)
-          [] -> (g, s, svs) -- No vertices left
-
-propagateSolution :: [Vertex] -> Graph -> Solution -> Stack Vertex -> Solution
-propagateSolution vs g@(_, [], f@(w, w2)) s svs =
-  let s' = foldl (\c x -> insert x (Reg $ findFirstMin (w ! x)) c) s vs
-   in go svs s' g
-  where
-    go :: Stack Vertex -> Solution -> Graph -> Solution
-    go [] s _ = s
-    go (x : svs) s g@(_, _, (w, w2)) =
-      let c = foldl (\c y -> addCostV c [let (Just sx) = elemIndex (s ! x) regs in cs !! sx | cs <- w2 ! (y, x)]) (w ! x) (adj g x)
-       in go svs (insert x (assignReg (findFirstMin c)) s) g
+propagateSolution :: [Vertex] -> Ctx -> State Solution ()
+propagateSolution vs1 (g@(vs2, _), stack, (w, w2)) = do
+  mapM_ (\x -> modify (insert x (assignReg $ findFirstMin (w ! x)))) (vs1 \\ vs2)
+  mapM_ (\x -> trace ("propagateSolution: x = " ++ show x) modify (
+    \solution -> trace ("solution = " ++ show solution) insert x (assignReg $ findFirstMin $ foldl (
+      \c y -> addCostV c $ matrixColumn (w2 ! (y, x)) $ regIndex (solution ! y)) (w ! x) (adj g x)) solution)) stack
 
 ----------------------
 
 regs :: [Register]
-regs = [Reg i | i <- [0 .. 9]] ++ [Spill]
+regs = Spill : [Reg i | i <- [0 .. 2]]
 
 assignReg :: Int -> Register
-assignReg i = regs !! i
+assignReg i = trace ("assignReg: i = " ++ show i) regs !! i
+
+regIndex :: Register -> Int
+regIndex r = trace ("regIndex: r = " ++ show r) fromJust $ elemIndex r regs
 
 regsClass :: [(Register, Char)]
-regsClass = (Spill, 's') : [(Reg i, 'a') | i <- [0 .. 3]] ++ [(Reg i, 'i') | i <- [4 .. 5]] ++ [(Reg i, 'f') | i <- [6 .. 9]]
+regsClass = (Spill, 's') : [(Reg i, 'a') | i <- [0 .. 2]]
 
 -- spilling costs
 spillCostF :: Int -> CostV
-spillCostF cost = map (\x -> if x == Spill then Inf else Finite cost) regs
+spillCostF cost = map (\x -> if x == Spill then Finite cost else Finite 0) regs
 
 -- class constrain
 classConstrainF :: Register -> CostV
-classConstrainF reg = let i = lookup reg regsClass in map (\x -> if lookup x regsClass == i then Finite 0 else Inf) regs
+classConstrainF reg = let i = lookup reg regsClass in map (\x -> if lookup x regsClass == i || x == Spill then Finite 0 else Inf) regs
 
 -- copy propagation
-copyPropF :: Int -> Register -> CostV
-copyPropF c reg = map (\x -> if x == reg then Finite (-c) else Finite 0) regs
+copyPropV :: Int -> Register -> CostV
+copyPropV c reg = map (\x -> if x == reg then Finite (-c) else Finite 0) regs
 
 symRegs :: [Vertex]
-symRegs = ["sa0", "sa1", "sa2", "sn0", "sn1", "sn2", "sfl0", "sf1", "sf2"]
+symRegs = Vertex <$> ["sa0", "sa1", "sa2"] -- "sn0", "sn1", "sn2", "sfl0", "sf1", "sf2"
 
 costVEmpty :: [Cost]
 costVEmpty = map (const $ Finite 0) regs
@@ -191,15 +176,15 @@ fs :: Map Vertex CostV
 fs =
   Map.fromList $
     fsEmpty
-      ++ [ ("sa0", addCostV (spillCostF 110) (classConstrainF $ Reg 0)),
-           ("sa1", addCostV (spillCostF 110) (classConstrainF $ Reg 1)),
-           ("sa2", addCostV (spillCostF 110) (addCostV (classConstrainF $ Reg 2) (copyPropF 5 $ Reg 2))),
-           ("sn0", addCostV (spillCostF 110) (classConstrainF $ Reg 3)),
-           ("sn1", addCostV (spillCostF 100) (classConstrainF $ Reg 4)),
-           ("sn2", addCostV (spillCostF 100) (classConstrainF $ Reg 5)),
-           ("sfl0", addCostV (spillCostF 220) (classConstrainF $ Reg 6)),
-           ("sf1", addCostV (spillCostF 200) (classConstrainF $ Reg 6)),
-           ("sf2", addCostV (spillCostF 200) (classConstrainF $ Reg 6))
+      ++ [ (Vertex "sa0", addCostV (spillCostF 110) (classConstrainF $ Reg 0)),
+           (Vertex "sa1", addCostV (spillCostF 110) (classConstrainF $ Reg 1)),
+           (Vertex "sa2", addCostV (spillCostF 110) (addCostV (classConstrainF $ Reg 2) (copyPropV 5 $ Reg 2)))
+           --  (Vertex "sn0", addCostV (spillCostF 110) (classConstrainF $ Reg 3)),
+           --  (Vertex "sn1", addCostV (spillCostF 100) (classConstrainF $ Reg 4)),
+           --  (Vertex "sn2", addCostV (spillCostF 100) (classConstrainF $ Reg 5)),
+           --  (Vertex "sfl0", addCostV (spillCostF 220) (classConstrainF $ Reg 6)),
+           --  (Vertex "sf1", addCostV (spillCostF 200) (classConstrainF $ Reg 6)),
+           --  (Vertex "sf2", addCostV (spillCostF 200) (classConstrainF $ Reg 6))
          ]
 
 -- interference constraint of two symbolic registre
@@ -209,20 +194,28 @@ interferenceCostM = [[if a /= b || a == Spill then Finite 0 else Inf | b <- regs
 costMEmpty :: [[Cost]]
 costMEmpty = [[Finite 0 | _ <- regs] | _ <- regs]
 
+edges :: [Edge]
+edges = [(Vertex "sa0", Vertex "sa1"), (Vertex "sa1", Vertex "sa2"), (Vertex "sa0", Vertex "sa2")]
+
+diEdges :: [Edge]
+diEdges = edges ++ map swap edges
+
 fss :: Map Edge CostM
-fss = let t = [(("sa0", "sa1"), interferenceCostM), (("sa0", "sa2"), interferenceCostM), (("sa1", "sa2"), interferenceCostM)] in Map.fromList $ fssEmpty ++ t
+fss = Map.fromList $ fssEmpty ++ map (,interferenceCostM) diEdges
 
 fssEmpty :: [(Edge, CostM)]
-fssEmpty = [((i, j), costMEmpty) | i <- symRegs, j <- symRegs]
+fssEmpty = [((i, j), costMEmpty) | i <- symRegs, j <- symRegs, i /= j]
 
-isZeros :: CostM -> Bool
-isZeros = all (all (== Finite 0))
-
-edges :: [Edge]
-edges = filter (\x -> not $ isZeros $ fss ! x) [(i, j) | i <- symRegs, j <- symRegs]
-
-inputGraph :: ([Vertex], [Edge], (Map Vertex CostV, Map Edge CostM))
-inputGraph = (symRegs, edges, (fs, fss))
+initCtx :: Ctx
+initCtx = ((symRegs, diEdges), [], (fs, fss))
 
 run :: Solution
-run = let (g, s, svs) = reduceGraph inputGraph Map.empty [] in propagateSolution symRegs g s svs
+run =
+  evalState
+    ( do
+        reduceGraph
+        ctx@((vs, _), stack, f) <- get
+        trace ("ctx after reduces: " ++ show ctx) $ pure ()
+        pure $ execState (propagateSolution symRegs ((vs, diEdges), stack, f)) Map.empty
+    )
+    initCtx
