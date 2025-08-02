@@ -3,13 +3,12 @@
 module Solver (run) where
 
 import Control.Monad (unless)
-import Control.Monad.State.Strict
+import Control.Monad.State
 import Data.List (delete, elemIndex, find, sortBy, (\\))
-import Data.Map.Strict (Map, insert, (!))
-import Data.Map.Strict qualified as Map
+import Data.Map (Map, insert, (!))
+import Data.Map qualified as Map
 import Data.Maybe (fromJust)
 import Data.Tuple (swap)
-import Debug.Trace (trace)
 
 newtype Vertex = Vertex String deriving (Show, Eq, Ord)
 
@@ -47,7 +46,7 @@ type Stack = [Vertex]
 type Ctx = (Graph, Stack, CostF)
 
 adj :: Graph -> Vertex -> [Vertex]
-adj (_, es) v =  let res =  [to | (from, to) <- es, from == v] in trace ("adj of " ++ show v ++ " = " ++ show res) res
+adj (_, es) v = [to | (from, to) <- es, from == v]
 
 degree :: Graph -> Vertex -> Int
 degree = (length .) . adj
@@ -71,12 +70,11 @@ removeVertex x (e@(from, to) : es) = if from == x || to == x then removeVertex x
 pushVertex :: Vertex -> State Ctx ()
 pushVertex x = do
   modify (\((vs, es), s, c) -> ((delete x vs, removeVertex x es), x : s, c))
-  trace ("pushVertex x = " ++ show x) $ pure ()
 
 findFirstMin :: (Ord a, Show a) => [a] -> Int
 findFirstMin xs = let x = minimum xs in head $ map fst (filter ((== x) . snd) (zip [0 ..] xs))
 
-matrixColumn :: Show a => [[a]] -> Int -> [a]
+matrixColumn :: (Show a) => [[a]] -> Int -> [a]
 matrixColumn m j = [row !! j | row <- m]
 
 transpose :: [[a]] -> [[a]]
@@ -133,23 +131,23 @@ reduceGraph = do
 propagateSolution :: [Vertex] -> Ctx -> State Solution ()
 propagateSolution vs1 (g@(vs2, _), stack, (w, w2)) = do
   mapM_ (\x -> modify (insert x (assignReg $ findFirstMin (w ! x)))) (vs1 \\ vs2)
-  mapM_ (\x -> trace ("propagateSolution: x = " ++ show x) modify (
-    \solution -> trace ("solution = " ++ show solution) insert x (assignReg $ findFirstMin $ foldl (
+  mapM_ (\x -> modify (
+    \solution -> insert x (assignReg $ findFirstMin $ foldl (
       \c y -> addCostV c $ matrixColumn (w2 ! (y, x)) $ regIndex (solution ! y)) (w ! x) (adj g x)) solution)) stack
 
 ----------------------
 
 regs :: [Register]
-regs = Spill : [Reg i | i <- [0 .. 2]]
+regs = Spill : [Reg i | i <- [0 .. 9]]
 
 assignReg :: Int -> Register
-assignReg i = trace ("assignReg: i = " ++ show i) regs !! i
+assignReg i = regs !! i
 
 regIndex :: Register -> Int
-regIndex r = trace ("regIndex: r = " ++ show r) fromJust $ elemIndex r regs
+regIndex r = fromJust $ elemIndex r regs
 
 regsClass :: [(Register, Char)]
-regsClass = (Spill, 's') : [(Reg i, 'a') | i <- [0 .. 2]]
+regsClass = (Spill, 's') : [(Reg i, 'a') | i <- [0 .. 3]] ++ [(Reg i, 'i') | i <- [4 .. 5]] ++ [(Reg i, 'f') | i <- [6 .. 9]]
 
 -- spilling costs
 spillCostF :: Int -> CostV
@@ -157,14 +155,15 @@ spillCostF cost = map (\x -> if x == Spill then Finite cost else Finite 0) regs
 
 -- class constrain
 classConstrainF :: Register -> CostV
-classConstrainF reg = let i = lookup reg regsClass in map (\x -> if lookup x regsClass == i || x == Spill then Finite 0 else Inf) regs
+classConstrainF reg = let i = lookup reg regsClass in map (
+  \x -> if lookup x regsClass == i || x == Spill then Finite 0 else Inf) regs
 
 -- copy propagation
 copyPropV :: Int -> Register -> CostV
 copyPropV c reg = map (\x -> if x == reg then Finite (-c) else Finite 0) regs
 
 symRegs :: [Vertex]
-symRegs = Vertex <$> ["sa0", "sa1", "sa2"] -- "sn0", "sn1", "sn2", "sfl0", "sf1", "sf2"
+symRegs = Vertex <$> ["sa0", "sa1", "sa2", "sn0", "sn1", "sn2", "sfl0", "sf1", "sf2"]
 
 costVEmpty :: [Cost]
 costVEmpty = map (const $ Finite 0) regs
@@ -178,13 +177,13 @@ fs =
     fsEmpty
       ++ [ (Vertex "sa0", addCostV (spillCostF 110) (classConstrainF $ Reg 0)),
            (Vertex "sa1", addCostV (spillCostF 110) (classConstrainF $ Reg 1)),
-           (Vertex "sa2", addCostV (spillCostF 110) (addCostV (classConstrainF $ Reg 2) (copyPropV 5 $ Reg 2)))
-           --  (Vertex "sn0", addCostV (spillCostF 110) (classConstrainF $ Reg 3)),
-           --  (Vertex "sn1", addCostV (spillCostF 100) (classConstrainF $ Reg 4)),
-           --  (Vertex "sn2", addCostV (spillCostF 100) (classConstrainF $ Reg 5)),
-           --  (Vertex "sfl0", addCostV (spillCostF 220) (classConstrainF $ Reg 6)),
-           --  (Vertex "sf1", addCostV (spillCostF 200) (classConstrainF $ Reg 6)),
-           --  (Vertex "sf2", addCostV (spillCostF 200) (classConstrainF $ Reg 6))
+           (Vertex "sa2", addCostV (spillCostF 110) (addCostV (classConstrainF $ Reg 2) (copyPropV 5 $ Reg 2))),
+           (Vertex "sn0", addCostV (spillCostF 110) (classConstrainF $ Reg 3)),
+           (Vertex "sn1", addCostV (spillCostF 100) (classConstrainF $ Reg 4)),
+           (Vertex "sn2", addCostV (spillCostF 100) (classConstrainF $ Reg 5)),
+           (Vertex "sfl0", addCostV (spillCostF 220) (classConstrainF $ Reg 6)),
+           (Vertex "sf1", addCostV (spillCostF 200) (classConstrainF $ Reg 6)),
+           (Vertex "sf2", addCostV (spillCostF 200) (classConstrainF $ Reg 6))
          ]
 
 -- interference constraint of two symbolic registre
@@ -214,8 +213,7 @@ run =
   evalState
     ( do
         reduceGraph
-        ctx@((vs, _), stack, f) <- get
-        trace ("ctx after reduces: " ++ show ctx) $ pure ()
+        ((vs, _), stack, f) <- get
         pure $ execState (propagateSolution symRegs ((vs, diEdges), stack, f)) Map.empty
     )
     initCtx
